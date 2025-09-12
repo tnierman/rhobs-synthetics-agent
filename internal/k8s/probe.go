@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,17 +20,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// ProbeManager handles the creation and management of probe Custom Resources
-type ProbeManager struct {
+type ProbeManager interface {
+	CreateProbe(api.Probe) error
+	DeleteProbe(api.Probe) error
+}
+
+// KubeProbeManager handles the creation and management of probe Custom Resources
+type KubeProbeManager struct {
 	namespace     string
 	httpClient    *http.Client
 	kubeClient    *kubeclient.Client
 	probeAPIGroup string // "monitoring.rhobs" or "monitoring.coreos.com" or ""
+	config        BlackboxProbingConfig
 }
 
-// NewProbeManager creates a new probe manager
-func NewProbeManager(namespace, kubeconfigPath string) *ProbeManager {
-	pm := &ProbeManager{
+// NewKubeProbeManager creates a new probe manager
+func NewKubeProbeManager(namespace, kubeconfigPath string, config BlackboxProbingConfig) (*KubeProbeManager, error) {
+	pm := &KubeProbeManager{
 		namespace: namespace,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
@@ -37,38 +44,15 @@ func NewProbeManager(namespace, kubeconfigPath string) *ProbeManager {
 	}
 
 	// Initialize Kubernetes clients and check cluster capabilities
-	pm.initializeK8sClients(kubeconfigPath)
-	return pm
-}
-
-// ValidateURL checks if a URL has valid format and scheme
-// Note: We only validate format and scheme, not connectivity, as URLs may be
-// temporarily unreachable during deployment or due to transient network issues.
-// The blackbox exporter will handle the actual connectivity monitoring.
-func (pm *ProbeManager) ValidateURL(targetURL string) error {
-	parsedURL, err := url.Parse(targetURL)
+	err := pm.initializeK8sClients(kubeconfigPath)
 	if err != nil {
-		return fmt.Errorf("invalid URL format: %w", err)
+		return pm, fmt.Errorf("failed to initialize kubernetes clients: %w", err)
 	}
-
-	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return fmt.Errorf("unsupported URL scheme: %s", parsedURL.Scheme)
-	}
-
-	if parsedURL.Host == "" {
-		return fmt.Errorf("URL must have a host")
-	}
-
-	return nil
+	return pm, nil
 }
 
 // initializeK8sClients sets up Kubernetes clients and checks cluster capabilities
-func (pm *ProbeManager) initializeK8sClients(kubeconfigPath string) {
-	// Check if running in a Kubernetes cluster
-	if !kubeclient.IsRunningInK8sCluster() {
-		return
-	}
-
+func (pm *KubeProbeManager) initializeK8sClients(kubeconfigPath string) error {
 	// Create Kubernetes client
 	cfg := kubeclient.Config{
 		KubeconfigPath: kubeconfigPath,
@@ -76,31 +60,26 @@ func (pm *ProbeManager) initializeK8sClients(kubeconfigPath string) {
 
 	client, err := kubeclient.NewClient(cfg)
 	if err != nil {
-		logger.Errorf("Failed to create Kubernetes client: %v", err)
-		return
+		return fmt.Errorf("Failed to create Kubernetes client: %v", err)
 	}
 
 	pm.kubeClient = client
 
 	// Check if Probe CRD exists
-	pm.checkProbeCRDs()
-}
-
-func (pm *ProbeManager) isK8sCluster() bool {
-	return pm.kubeClient != nil
+	err = pm.checkProbeCRDs()
+	if err != nil {
+		return fmt.Errorf("failed to locate Probe CRD: %w", err)
+	}
+	return nil
 }
 
 // checkProbeCRDs checks if Probe CRDs exist in the cluster
-func (pm *ProbeManager) checkProbeCRDs() {
-	if pm.kubeClient == nil {
-		return
-	}
-
+func (pm *KubeProbeManager) checkProbeCRDs() error {
 	// Check if the CRDs exist
 	crdClient := pm.kubeClient.Clientset().Discovery()
 	_, apiLists, err := crdClient.ServerGroupsAndResources()
 	if err != nil {
-		return
+		return fmt.Errorf("failed to retrieve api-resources")
 	}
 
 	// Prefer monitoring.rhobs, fallback to monitoring.coreos.com
@@ -110,7 +89,7 @@ func (pm *ProbeManager) checkProbeCRDs() {
 				if resource.Kind == "Probe" {
 					pm.probeAPIGroup = "monitoring.rhobs"
 					logger.Infof("Using monitoring.rhobs/v1 for Probe resources")
-					return
+					return nil
 				}
 			}
 		}
@@ -122,37 +101,24 @@ func (pm *ProbeManager) checkProbeCRDs() {
 				if resource.Kind == "Probe" {
 					pm.probeAPIGroup = "monitoring.coreos.com"
 					logger.Infof("Using monitoring.coreos.com/v1 for Probe resources")
-					return
+					return nil
 				}
 			}
 		}
 	}
 
-	logger.Errorf("No compatible Probe CRDs found in cluster")
+	return fmt.Errorf("no compatible Probe CRDs found in cluster")
 }
 
 // SetProbeAPIGroup sets the API group for testing purposes
-func (pm *ProbeManager) SetProbeAPIGroup(apiGroup string) {
+func (pm *KubeProbeManager) SetProbeAPIGroup(apiGroup string) {
 	pm.probeAPIGroup = apiGroup
 }
 
-// CreateProbeK8sResource creates and applies a Probe Custom Resource to Kubernetes
-func (pm *ProbeManager) CreateProbeK8sResource(probe api.Probe, config BlackboxProbingConfig) error {
-	// Check if we can create Kubernetes resources
-	if !pm.isK8sCluster() {
-		return fmt.Errorf("not running in a Kubernetes cluster")
-	}
-
-	if pm.probeAPIGroup == "" {
-		return fmt.Errorf("no compatible Probe CRDs found in cluster")
-	}
-
-	if pm.kubeClient == nil {
-		return fmt.Errorf("kubernetes client not available")
-	}
-
+// CreateProbe creates and applies a Probe Custom Resource to Kubernetes
+func (pm *KubeProbeManager) CreateProbe(probe api.Probe) error {
 	// Create the probe Custom Resource definition
-	probeResource, err := pm.CreateProbeResource(probe, config)
+	probeResource, err := createProbeResource(probe, pm.config, pm.namespace, pm.probeAPIGroup)
 	if err != nil {
 		return fmt.Errorf("failed to create probe resource definition: %w", err)
 	}
@@ -186,21 +152,8 @@ func (pm *ProbeManager) CreateProbeK8sResource(probe api.Probe, config BlackboxP
 	return nil
 }
 
-// DeleteProbeK8sResource deletes a Probe Custom Resource from Kubernetes
-func (pm *ProbeManager) DeleteProbeK8sResource(probe api.Probe) error {
-	// Check if we can interact with Kubernetes resources
-	if !pm.isK8sCluster() {
-		return fmt.Errorf("not running in a Kubernetes cluster")
-	}
-
-	if pm.probeAPIGroup == "" {
-		return fmt.Errorf("no compatible Probe CRDs found in cluster")
-	}
-
-	if pm.kubeClient == nil {
-		return fmt.Errorf("kubernetes client not available")
-	}
-
+// DeleteProbe deletes a Probe Custom Resource from Kubernetes
+func (pm *KubeProbeManager) DeleteProbe(probe api.Probe) error {
 	// Define the GVR for Probe resources
 	probeGVR := schema.GroupVersionResource{
 		Group:    pm.probeAPIGroup,
@@ -237,9 +190,42 @@ func (pm *ProbeManager) DeleteProbeK8sResource(probe api.Probe) error {
 	return nil
 }
 
+type LogProbeManager struct {
+	config    BlackboxProbingConfig
+	namespace string
+}
+
+func NewLogProbeManager(namespace string, cfg BlackboxProbingConfig) *LogProbeManager {
+	pm := LogProbeManager{
+		config:    cfg,
+		namespace: namespace,
+	}
+	return &pm
+}
+
+func (pm *LogProbeManager) CreateProbe(probe api.Probe) error {
+	cr, err := createProbeResource(probe, pm.config, pm.namespace, "")
+	if err != nil {
+		return fmt.Errorf("failed to create probe resource: %w", err)
+	}
+
+	crBytes, err := json.MarshalIndent(cr, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal probe custom resource to JSON: %w", err)
+	}
+
+	logger.Infof("Would create probe Custom Resource:\n%s", string(crBytes))
+	return nil
+}
+
+func (pm *LogProbeManager) DeleteProbe(probe api.Probe) error {
+	logger.Infof("Would have deleted probe: ")
+	return nil
+}
+
 // CreateProbeResource creates a Probe Custom Resource (compatible with both monitoring.coreos.com/v1 and monitoring.rhobs/v1)
-func (pm *ProbeManager) CreateProbeResource(probe api.Probe, config BlackboxProbingConfig) (*monitoringv1.Probe, error) {
-	if err := pm.ValidateURL(probe.StaticURL); err != nil {
+func createProbeResource(probe api.Probe, config BlackboxProbingConfig, namespace, apiGroup string) (*monitoringv1.Probe, error) {
+	if err := validateURL(probe.StaticURL); err != nil {
 		return nil, fmt.Errorf("URL validation failed for probe %s: %w", probe.ID, err)
 	}
 
@@ -268,7 +254,6 @@ func (pm *ProbeManager) CreateProbeResource(probe api.Probe, config BlackboxProb
 
 	// Create the Probe Custom Resource using the actual CRD types
 	// Use detected API group, fallback to monitoring.coreos.com for backwards compatibility
-	apiGroup := pm.probeAPIGroup
 	if apiGroup == "" {
 		apiGroup = "monitoring.coreos.com"
 	}
@@ -280,7 +265,7 @@ func (pm *ProbeManager) CreateProbeResource(probe api.Probe, config BlackboxProb
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("probe-%s", probe.ID),
-			Namespace: pm.namespace,
+			Namespace: namespace,
 			Labels:    metadataLabels,
 		},
 		Spec: monitoringv1.ProbeSpec{
@@ -299,6 +284,27 @@ func (pm *ProbeManager) CreateProbeResource(probe api.Probe, config BlackboxProb
 	}
 
 	return probeResource, nil
+}
+
+// ValidateURL checks if a URL has valid format and scheme
+// Note: We only validate format and scheme, not connectivity, as URLs may be
+// temporarily unreachable during deployment or due to transient network issues.
+// The blackbox exporter will handle the actual connectivity monitoring.
+func validateURL(targetURL string) error {
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL format: %w", err)
+	}
+
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return fmt.Errorf("unsupported URL scheme: %s", parsedURL.Scheme)
+	}
+
+	if parsedURL.Host == "" {
+		return fmt.Errorf("URL must have a host")
+	}
+
+	return nil
 }
 
 func convertToUnstructured(object interface{}) (*unstructured.Unstructured, error) {

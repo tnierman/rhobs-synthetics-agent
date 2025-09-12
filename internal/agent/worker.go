@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -19,7 +18,7 @@ const defaultProbeNamespace = "default"
 type Worker struct {
 	config            *Config
 	apiClients        []*api.Client
-	probeManager      *k8s.ProbeManager
+	probeManager      k8s.ProbeManager
 	proberManager     k8s.ProberManager
 	prometheusManager k8s.PrometheusManager
 	readinessCallback func(bool)
@@ -63,10 +62,16 @@ func NewWorker(cfg *Config) (*Worker, error) {
 		}
 	}
 
-	probeManager := k8s.NewProbeManager(namespace, kubeConfigPath)
+	var probeManager k8s.ProbeManager
 	var proberManager k8s.ProberManager
 	var err error
 	if kubeConfigPath != "" || kubeclient.IsRunningInK8sCluster() {
+		// Running in valid kubernetes environment - create appropriate resources
+		probeManager, err = k8s.NewKubeProbeManager(namespace, kubeConfigPath, cfg.Blackbox.Probing)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create kubernetes ProbeManager: %w", err)
+		}
+
 		// Create prober manager configuration
 		proberManagerConfig := k8s.BlackBoxProberManagerConfig{
 			Namespace:      namespace,
@@ -93,6 +98,10 @@ func NewWorker(cfg *Config) (*Worker, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create prober manager: %w", err)
 		}
+	} else {
+		// Not running in kubernetes environment - log only
+		logger.Info("Not running in a kubernetes environment; enabling log-only mode")
+		probeManager = k8s.NewLogProbeManager(namespace, cfg.Blackbox.Probing)
 	}
 
 	// Type assert to ensure BlackBoxProberManager implements both interfaces
@@ -372,30 +381,13 @@ func (w *Worker) createProbe(ctx context.Context, probe api.Probe) error {
 	logger.Infof("Processing probe %s with target URL: %s", probe.ID, probe.StaticURL)
 
 	// Try to create the probe Custom Resource in Kubernetes
-	err := w.probeManager.CreateProbeK8sResource(probe, w.config.Blackbox.Probing)
+	err := w.probeManager.CreateProbe(probe)
 	if err != nil {
-		// If K8s creation fails, fall back to logging the resource definition
-		logger.Infof("Failed to create Kubernetes resource (falling back to logging): %v", err)
-
-		cr, crErr := w.probeManager.CreateProbeResource(probe, w.config.Blackbox.Probing)
-		if crErr != nil {
-			w.updateProbeStatus(probe.ID, "failed")
-			return fmt.Errorf("failed to create probe resource definition: %w", crErr)
-		}
-
-		crJSON, jsonErr := json.MarshalIndent(cr, "", "  ")
-		if jsonErr != nil {
-			logger.Infof("Failed to marshal CR to JSON: %v", jsonErr)
-		} else {
-			logger.Infof("Would create probe Custom Resource:\n%s", string(crJSON))
-		}
-
-		logger.Infof("Probe %s processed (logged only - not running in compatible K8s cluster)", probe.ID)
-		w.updateProbeStatus(probe.ID, "active")
-	} else {
-		logger.Infof("Successfully created monitoring.coreos.com/v1 Probe resource for probe %s", probe.ID)
-		w.updateProbeStatus(probe.ID, "active")
+		return fmt.Errorf("failed to create probe %s: %w", probe.ID, err)
 	}
+
+	logger.Infof("Successfully created monitoring.coreos.com/v1 Probe resource for probe %s", probe.ID)
+	w.updateProbeStatus(probe.ID, "active")
 	return nil
 }
 
@@ -417,7 +409,7 @@ func (w *Worker) deleteProbe(ctx context.Context, shutdownChan chan struct{}) er
 			return nil
 		default:
 		}
-		err := w.probeManager.DeleteProbeK8sResource(probe)
+		err := w.probeManager.DeleteProbe(probe)
 		if err != nil {
 			return fmt.Errorf("failed to delete CR for probe %s: %w", probe.ID, err)
 		}
